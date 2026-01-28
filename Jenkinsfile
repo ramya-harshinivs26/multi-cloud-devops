@@ -20,7 +20,7 @@ pipeline {
                 bat '''
                 docker stop website >nul 2>&1 || exit /b 0
                 docker rm website >nul 2>&1 || exit /b 0
-                docker run -d -p 8081:80 --name website static-website
+                docker run -d -p 8082:80 --name website static-website
                 '''
             }
         }
