@@ -11,15 +11,15 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
-                sh 'docker build -t static-website .'
+                bat 'docker build -t static-website .'
             }
         }
 
         stage('Run Website') {
             steps {
-                sh '''
-                docker stop website || true
-                docker rm website || true
+                bat '''
+                docker stop website >nul 2>&1 || exit /b 0
+                docker rm website >nul 2>&1 || exit /b 0
                 docker run -d -p 8081:80 --name website static-website
                 '''
             }
