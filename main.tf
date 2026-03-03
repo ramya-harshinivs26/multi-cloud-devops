@@ -1,28 +1,31 @@
-# Terraform configuration for AWS EC2 + Docker Static Website
-# Project: Multi-Cloud Static Website Deployment
+# Terraform configuration for Azure VM + Docker
+# Project: Multi-Cloud CI/CD with Monitoring
 # Author: Ramya
 # Date: January 2026
 
 terraform {
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 4.0"
     }
+
     http = {
       source  = "hashicorp/http"
       version = "~> 3.0"
     }
+
   }
 }
 
-provider "aws" {
-  region = "ap-south-1" # Mumbai region (closest to Tamil Nadu)
+provider "azurerm" {
+  features {}
+  subscription_id = "2844b3ce-6365-47df-b696-441aa242fe24"
 }
 
 # ─────────────────────────────────────────────
 # Fetch your current public IP dynamically
-# (used to restrict SSH access - same as Azure)
+# (used to restrict SSH access)
 # ─────────────────────────────────────────────
 data "http" "my_ip" {
   url = "https://api.ipify.org"
@@ -30,194 +33,198 @@ data "http" "my_ip" {
 
 locals {
   my_public_ip = chomp(data.http.my_ip.response_body)
-  # Fallback if fetch fails: "0.0.0.0/0" (insecure - only for testing!)
+  # If fetching fails for any reason, you can temporarily fallback to:
+  # my_public_ip = "0.0.0.0"   # but NEVER leave this in production!
 }
 
 # ─────────────────────────────────────────────
-# Latest Amazon Linux 2023 AMI (x86_64)
+# Resource Group
 # ─────────────────────────────────────────────
-data "aws_ssm_parameter" "al2023_ami" {
-  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+resource "azurerm_resource_group" "rg" {
+  name     = "ecom-multi-cloud-website"
+  location = "centralindia" # Change to eastus / southeastasia etc. if needed
 }
 
 # ─────────────────────────────────────────────
-# VPC & Subnet (AWS equivalent of Azure VNet/Subnet)
+# Virtual Network & Subnet
 # ─────────────────────────────────────────────
-data "aws_vpc" "default" {
-  default = true
+resource "azurerm_virtual_network" "vnet" {
+  name                = "ramya-vnet"
+  address_space       = ["10.0.0.0/16"]
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
 }
 
-data "aws_subnet" "default" {
-  vpc_id            = data.aws_vpc.default.id
-  availability_zone = "ap-south-1a" # or let it pick first available
-  default_for_az    = true
+resource "azurerm_subnet" "subnet" {
+  name                 = "web-subnet"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.0.1.0/24"]
 }
 
 # ─────────────────────────────────────────────
-# Public IP (Elastic IP - AWS equivalent of Azure Static Public IP)
+# Public IP (Static – keeps the same IP after restarts)
 # ─────────────────────────────────────────────
-resource "aws_eip" "static_ip" {
-  domain = "vpc"
+resource "azurerm_public_ip" "public_ip" {
+  name                = "web-public-ip"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+# ─────────────────────────────────────────────
+# Network Security Group (HTTP open + SSH from your IP only)
+# ─────────────────────────────────────────────
+resource "azurerm_network_security_group" "nsg" {
+  name                = "web-nsg"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  security_rule {
+    name                       = "Allow-HTTP"
+    priority                   = 1001
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "80"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "Allow-SSH"
+    priority                   = 1002
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = local.my_public_ip # ← dynamically fetched your IP
+    destination_address_prefix = "*"
+  }
+
+  # Optional: deny all other inbound (Azure adds a default deny, but explicit is clearer)
+  security_rule {
+    name                       = "Deny-All-Inbound"
+    priority                   = 4096
+    direction                  = "Inbound"
+    access                     = "Deny"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+}
+
+# ─────────────────────────────────────────────
+# Network Interface
+# ─────────────────────────────────────────────
+resource "azurerm_network_interface" "nic" {
+  name                = "web-nic"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.subnet.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.public_ip.id
+  }
+
+  depends_on = [
+    azurerm_subnet.subnet,
+    azurerm_virtual_network.vnet,
+    azurerm_public_ip.public_ip
+  ]
+}
+
+resource "azurerm_network_interface_security_group_association" "nsg_assoc" {
+  network_interface_id      = azurerm_network_interface.nic.id
+  network_security_group_id = azurerm_network_security_group.nsg.id
+}
+
+# ─────────────────────────────────────────────
+# Linux VM (Ubuntu 22.04) + Docker + Your App
+# ─────────────────────────────────────────────
+resource "azurerm_linux_virtual_machine" "app_vm" {
+  name                            = "ecom-multi-cloud-vm"
+  resource_group_name             = azurerm_resource_group.rg.name
+  location                        = azurerm_resource_group.rg.location
+  size                            = "Standard_D2s_v3" # small burstable – cheap
+  admin_username                  = "azureuser"
+  admin_password                  = "R@my@@26!!!" # ← CHANGE THIS to something strong!
+  disable_password_authentication = false
+
+  network_interface_ids = [azurerm_network_interface.nic.id]
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts-gen2"
+    version   = "latest"
+  }
+
+  # Cloud-init: install Docker + run container
+ custom_data = base64encode(<<-EOT
+  #!/bin/bash
+  apt-get update -y && apt-get upgrade -y
+  apt-get install -y docker.io
+  systemctl start docker
+  systemctl enable docker
+  usermod -aG docker azureuser
+
+  # Optional: pull latest image first
+  docker pull ramyavs/static-website:latest
+
+  # Stop and remove old container if exists (idempotent)
+  docker stop ramya-static-app || true
+  docker rm ramya-static-app || true
+
+  docker run -d --restart unless-stopped \
+    -p 80:80 \
+    --name ramya-static-app \
+    ramyavs/static-website:latest
+
+  echo "Container (updated) started at $(date)" > /home/azureuser/app-started.txt
+  echo "Updated at $(date)" >> /var/log/cloud-init-custom.log
+EOT
+)
+
   tags = {
-    Name    = "ramya-website-static-ip"
-    project = "multi-cloud-static-site"
-  }
-}
-
-# ─────────────────────────────────────────────
-# Security Group (AWS equivalent of Azure NSG)
-# HTTP on port 82 + SSH from your IP only
-# ─────────────────────────────────────────────
-resource "aws_security_group" "allow_http82_and_ssh" {
-  name        = "ramya-website-sg"
-  description = "Allow HTTP on port 82 from anywhere + SSH from my IP"
-  vpc_id      = data.aws_vpc.default.id
-
-  # HTTP on port 82 (same as your Azure setup)
-  ingress {
-    description = "HTTP port 82 from anywhere"
-    from_port   = 82
-    to_port     = 82
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # SSH from your current IP only (dynamic - same as Azure)
-  ingress {
-    description = "SSH from my current IP"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["${local.my_public_ip}/32"]
-  }
-
-  # Allow all outbound traffic
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name        = "ramya-website-sg"
-    project     = "multi-cloud-static-site"
+    project     = "multi-cloud-ci-cd"
     environment = "dev"
     owner       = "ramya"
   }
-}
 
-# ─────────────────────────────────────────────
-# EC2 Instance (AWS equivalent of Azure Linux VM)
-# Amazon Linux 2023 + Docker + Static Website
-# ─────────────────────────────────────────────
-resource "aws_instance" "website" {
-  ami                    = data.aws_ssm_parameter.al2023_ami.value
-  instance_type          = "t3.micro" # Free-tier eligible (equivalent to B2s)
-  subnet_id              = data.aws_subnet.default.id
-  vpc_security_group_ids = [aws_security_group.allow_http82_and_ssh.id]
-
-  # Associate the static Elastic IP
-  associate_public_ip_address = true
-  private_ip                  = null # Let AWS assign
-
-  # Optional: SSH key pair for secure access (create one in AWS console first)
-  # key_name = "ramya-mumbai-key"  # ← Uncomment and add your key pair name
-
-  # User data script (AWS equivalent of Azure custom_data)
-  user_data = base64encode(<<-EOT
-    #!/bin/bash
-    echo "Starting user-data script at $(date)" >> /var/log/user-data.log 2>&1
-
-    # Update system and install Docker
-    dnf update -y
-    dnf install -y docker
-
-    # Start and enable Docker service
-    systemctl start docker
-    systemctl enable docker
-
-    # Add ec2-user to docker group (no sudo needed)
-    usermod -aG docker ec2-user
-
-    # Give Docker time to initialize
-    sleep 10
-
-    # Stop and remove old container if exists (idempotent)
-    docker stop ramya-static-app || true
-    docker rm ramya-static-app || true
-
-    # Pull and run static website container on port 82 → 80
-    docker run -d --restart unless-stopped \
-      -p 82:80 \
-      --name ramya-static-app \
-      ramyavs/static-website:latest \
-      >> /var/log/user-data.log 2>&1
-
-    # Log success
-    echo "Static website started on port 82 at $(date)" > /home/ec2-user/app-started.txt
-    echo "Image: ramyavs/static-website:latest" >> /home/ec2-user/app-started.txt
-    echo "Access: http://<your-public-ip>:82" >> /home/ec2-user/app-started.txt
-    echo "Check logs: docker logs ramya-static-app" >> /home/ec2-user/app-started.txt
-
-    echo "User-data script finished at $(date)" >> /var/log/user-data.log
-  EOT
-  )
-
-  # Associate the Elastic IP after instance creation
-  depends_on = [aws_eip.static_ip]
-
-  tags = {
-    Name        = "ramya-static-website-ec2"
-    project     = "multi-cloud-static-site"
-    environment = "dev"
-    owner       = "ramya"
-    purpose     = "static-website"
-  }
-
-  # Ensure EIP association
-  lifecycle {
-    ignore_changes = [associate_public_ip_address]
-  }
-}
-
-# ─────────────────────────────────────────────
-# Associate Elastic IP with EC2 Instance
-# ─────────────────────────────────────────────
-resource "aws_eip_association" "eip_assoc" {
-  instance_id   = aws_instance.website.id
-  allocation_id = aws_eip.static_ip.id
+  depends_on = [azurerm_network_interface_security_group_association.nsg_assoc]
 }
 
 # ─────────────────────────────────────────────
 # Outputs – Important info after terraform apply
 # ─────────────────────────────────────────────
-output "vpc_id" {
-  value       = data.aws_vpc.default.id
-  description = "Default VPC ID"
+output "resource_group_name" {
+  value = azurerm_resource_group.rg.name
 }
 
-output "website_url" {
-  value       = "http://${aws_eip.static_ip.public_ip}:82"
-  description = "Open this URL in browser (wait 2-4 minutes after apply)"
+output "vm_public_ip" {
+  value       = azurerm_public_ip.public_ip.ip_address
+  description = "Wait 4-8 minutes after apply, then open http://this-ip in browser"
 }
 
-output "ec2_public_ip" {
-  value       = aws_eip.static_ip.public_ip
-  description = "Static Public IP - use this for SSH and website access"
-}
-
-output "ssh_command_example" {
-  value       = "ssh -i your-key.pem ec2-user@${aws_eip.static_ip.public_ip}"
-  description = "SSH command (uncomment key_name in code first)"
+output "vm_ssh_command_example" {
+  value       = "ssh azureuser@${azurerm_public_ip.public_ip.ip_address}"
+  description = "Use the password you set. Run from your local machine (only works from your current IP)"
 }
 
 output "your_current_ip_used_for_ssh" {
   value       = local.my_public_ip
-  description = "This IP was used to allow SSH access - re-apply if it changes"
-}
-
-output "docker_container_name" {
-  value       = "ramya-static-app"
-  description = "Name of the running Docker container"
+  description = "This is the IP Terraform used to allow SSH – if it changes, re-apply"
 }
